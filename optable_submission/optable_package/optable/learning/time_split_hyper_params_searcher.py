@@ -1,0 +1,163 @@
+import gc
+
+import lightgbm as lgb
+import optuna
+import numpy as np
+from sklearn import model_selection
+
+from optable.learning import learner
+
+
+class TimeSplitHyperParamsSearcher(learner.Learner):
+    def __init__(self, mode, timer):
+        self.__params = None
+        self.__mode = mode
+        self.__timer = timer
+        self.__seed = 1360457
+
+    @property
+    def params(self):
+        if self.__params is None:
+            raise RuntimeError("params is not optimized")
+
+    def fit(self, X, y, sorted_time_index, categorical_feature):
+        one_num = (y == 1).sum()
+        zero_num = (y == 0).sum()
+        if one_num > zero_num:
+            major_minor_ratio = one_num / zero_num
+        else:
+            major_minor_ratio = zero_num / one_num
+
+        train_X, test_X, train_y, test_y = \
+            model_selection.train_test_split(
+                X, y, train_size=0.5, shuffle=False)
+        if len(train_X) > 30000:
+            train_X, _, train_y, _ = \
+                model_selection.train_test_split(
+                    train_X, train_y,
+                    train_size=max([int(0.2 * len(train_X)), 30000]),
+                    stratify=train_y, random_state=1)
+        if len(test_X) > 30000:
+            test_X, _, test_y, _ = \
+                model_selection.train_test_split(
+                    test_X, test_y,
+                    train_size=max([int(0.2 * len(test_X)), 30000]),
+                    stratify=test_y, random_state=1)
+
+        train_data = lgb.Dataset(train_X, label=train_y)
+        test_data = lgb.Dataset(test_X, label=test_y)
+
+        if self.__mode == "auc":
+            params = {
+                "objective": "binary",
+                "metric": "auc",
+                "verbosity": -1,
+                "seed": 1,
+                "num_threads": 4,
+                "two_round": True,
+                "bagging_freq": 1,
+                "histogram_pool_size": 4 * 1024,
+                "max_cat_to_onehot": 10,
+                "cegb_penalty_split": 1e-6,
+                "bagging_fraction": 0.999,
+            }
+        else:
+            params = {
+                "objective": "binary",
+                "metric": "binary_logloss",
+                "verbosity": -1,
+                "seed": 1,
+                "num_threads": 4,
+                "two_round": True,
+                "bagging_freq": 1,
+                "histogram_pool_size": 4 * 1024,
+                "max_cat_to_onehot": 10,
+                "cegb_penalty_split": 1e-6,
+                "bagging_fraction": 0.999,
+            }
+        if one_num > zero_num:
+            majority_bagging_fraction = "pos_bagging_fraction"
+        else:
+            majority_bagging_fraction = "neg_bagging_fraction"
+
+        def objective(trial):
+            self.__seed += 109421
+            params["seed"] = self.__seed
+            num_leaves_ratio = \
+                trial.suggest_uniform("num_leaves_ratio", 0.3, 0.8)
+            max_depth = trial.suggest_int("max_depth", 4, 7)
+            num_leaves = int((2 ** max_depth - 1) * num_leaves_ratio)
+            hyperparams = {
+                "learning_rate": trial.suggest_uniform(
+                    "learning_rate", 0.01, 0.05),
+                "max_depth": max_depth,
+                "num_leaves": num_leaves,
+                "reg_alpha": trial.suggest_uniform("reg_alpha", 1e-2, 1),
+                "reg_lambda": trial.suggest_uniform(
+                    "reg_lambda", 1e-2, 1),
+                "min_gain_to_split": trial.suggest_uniform(
+                    "min_gain_to_split", 1e-2, 1),
+                "min_child_weight": trial.suggest_uniform(
+                    'min_child_weight', 1, 20),
+                "max_bin": trial.suggest_int(
+                    "max_bin", 64, 127),
+            }
+            hyperparams["under_sampling"] = trial.suggest_uniform(
+                "under_sampling",
+                0.8 * major_minor_ratio,
+                0.995 * major_minor_ratio
+            )
+
+            if self.__mode == "auc":
+                pruning_callback = optuna.integration.LightGBMPruningCallback(
+                    trial, 'auc')
+            else:
+                pruning_callback = optuna.integration.LightGBMPruningCallback(
+                    trial, 'binary_logloss')
+            model = lgb.train({**params, **hyperparams}, train_data, 64,
+                              test_data,
+                              verbose_eval=0,
+                              categorical_feature=categorical_feature,
+                              callbacks=[pruning_callback])
+
+            score = model.best_score["valid_0"][params["metric"]]
+
+            return score
+
+        if self.__mode == "auc":
+            direction = 'maximize'
+        else:
+            direction = 'minimize'
+
+        def gamma(x):
+            return min(int(np.ceil(1 * np.sqrt(x))), 25)
+
+        study = optuna.create_study(
+            # sampler=optuna.integration.SkoptSampler(),
+            sampler=optuna.samplers.TPESampler(
+                n_startup_trials=5, gamma=gamma, seed=0),
+            pruner=optuna.pruners.SuccessiveHalvingPruner(
+                min_resource=4, reduction_factor=2),
+            direction=direction)
+        study.optimize(
+            objective, n_trials=50,
+            timeout=0.15*self.__timer.time_budget)
+
+        gc.collect()
+
+        trials = sorted(study.trials, key=lambda trial: trial.value)
+        if self.__mode == "auc":
+            trials = trials[::-1]
+        print([trial.value for trial in trials])
+
+        params_list = []
+        for trial in trials[:3]:
+            hyperparams = trial.params
+            num_leaves_ratio = hyperparams.pop("num_leaves_ratio")
+            max_depth = int(hyperparams.pop("max_depth"))
+            num_leaves = int((2 ** max_depth - 1) * num_leaves_ratio)
+            hyperparams["max_depth"] = max_depth
+            hyperparams["num_leaves"] = num_leaves
+            params_list.append({**params, **hyperparams})
+
+        return params_list

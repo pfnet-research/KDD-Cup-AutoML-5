@@ -1,0 +1,6 @@
+[submodule "optable_submission/optable_package/src/redsvd-h"]
+	path = optable_submission/optable_package/src/redsvd-h
+	url = https://github.com/ntessore/redsvd-h.git
+[submodule "optable_submission/optable_package/src/pybind11"]
+	path = optable_submission/optable_package/src/pybind11
+	url = https://github.com/pybind/pybind11.git
